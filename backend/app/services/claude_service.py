@@ -3,14 +3,15 @@ Serviço de IA: única camada que conhece a SDK da Anthropic.
 
 Responsabilidades:
 - Criar e reaproveitar o cliente assíncrono da Anthropic.
-- Enviar currículo + vaga ao Claude com Structured Outputs, garantindo que a
-  resposta siga exatamente o schema `AIOptimizationResult`.
+- Enviar currículo + carta padrão + vaga ao Claude com Structured Outputs,
+  garantindo que a resposta siga exatamente o schema `AIOptimizationResult`.
 - Traduzir erros da SDK em exceções de domínio (o mapeamento para HTTP fica em
   `app/core/exceptions.py`).
 """
 
 import logging
 import time
+from dataclasses import dataclass
 
 import anthropic
 
@@ -22,12 +23,7 @@ from app.core.exceptions import (
     AIServiceUnavailableError,
     InvalidInputError,
 )
-from app.schemas.resume import (
-    AIOptimizationResult,
-    OptimizeRequest,
-    OptimizeResponse,
-    UsageMetadata,
-)
+from app.schemas.resume import AIOptimizationResult, ResolvedOptimizeInput, UsageMetadata
 from app.services.prompts import SYSTEM_PROMPT, build_user_prompt
 
 logger = logging.getLogger(__name__)
@@ -36,6 +32,14 @@ logger = logging.getLogger(__name__)
 # de segurança recusa a requisição (stop_reason == "refusal").
 _FALLBACK_BETA = "server-side-fallback-2026-07-01"
 _FALLBACK_MODELS = {"claude-opus-5-5", "claude-opus-5", "claude-fable-5-1", "claude-sonnet-5-5"}
+
+
+@dataclass(frozen=True, slots=True)
+class AIGeneration:
+    """Resultado bruto da IA + métricas de uso."""
+
+    result: AIOptimizationResult
+    usage: UsageMetadata
 
 
 class ClaudeResumeService:
@@ -55,8 +59,8 @@ class ClaudeResumeService:
         """Fecha o pool de conexões HTTP (chamado no shutdown da aplicação)."""
         await self._client.close()
 
-    async def optimize_resume(self, request: OptimizeRequest) -> OptimizeResponse:
-        """Envia currículo e vaga ao Claude e devolve o resultado estruturado."""
+    async def generate(self, request: ResolvedOptimizeInput) -> AIGeneration:
+        """Envia currículo, carta padrão e vaga ao Claude e devolve o resultado estruturado."""
         settings = self._settings
         started = time.perf_counter()
 
@@ -65,6 +69,7 @@ class ClaudeResumeService:
             job_description=request.job_description,
             language=request.language.value,
             include_cover_letter=request.include_cover_letter,
+            cover_letter_template=request.cover_letter_template,
         )
 
         # Fallback automático só é enviado para modelos que o suportam.
@@ -168,25 +173,15 @@ class ClaudeResumeService:
             response.usage.output_tokens,
         )
 
-        return OptimizeResponse(
-            **result.model_dump(),
-            keyword_coverage=_keyword_coverage(result),
-            metadata=UsageMetadata(
+        return AIGeneration(
+            result=result,
+            usage=UsageMetadata(
                 model=response.model,
                 input_tokens=response.usage.input_tokens,
                 output_tokens=response.usage.output_tokens,
                 processing_time_ms=elapsed_ms,
             ),
         )
-
-
-def _keyword_coverage(result: AIOptimizationResult) -> float:
-    """Percentual de palavras-chave da vaga comprovadas pelo currículo."""
-    keywords = result.job_analysis.keywords
-    if not keywords:
-        return 0.0
-    present = sum(1 for kw in keywords if kw.present_in_resume)
-    return round(present / len(keywords) * 100, 1)
 
 
 def _parse_retry_after(exc: anthropic.APIStatusError) -> int:

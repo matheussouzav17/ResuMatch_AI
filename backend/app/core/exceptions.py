@@ -37,6 +37,37 @@ class InvalidInputError(ResuMatchError):
     code = "INVALID_INPUT"
 
 
+# --- Documentos enviados pelo usuário -------------------------------------
+class UnsupportedFileTypeError(ResuMatchError):
+    """Extensão ou tipo de arquivo não aceito (só PDF, DOCX e TXT)."""
+
+    status_code = status.HTTP_415_UNSUPPORTED_MEDIA_TYPE
+    code = "UNSUPPORTED_FILE_TYPE"
+
+
+class FileTooLargeError(ResuMatchError):
+    """Arquivo acima de MAX_UPLOAD_MB."""
+
+    status_code = status.HTTP_413_CONTENT_TOO_LARGE
+    code = "FILE_TOO_LARGE"
+
+
+class DocumentParsingError(ResuMatchError):
+    """Arquivo corrompido, protegido por senha ou sem texto extraível (ex.: PDF escaneado)."""
+
+    status_code = status.HTTP_422_UNPROCESSABLE_CONTENT
+    code = "DOCUMENT_UNREADABLE"
+
+
+# --- Vaga por URL ----------------------------------------------------------
+class JobExtractionError(ResuMatchError):
+    """Não foi possível ler a vaga a partir do link (bloqueio, login, página dinâmica...)."""
+
+    status_code = status.HTTP_422_UNPROCESSABLE_CONTENT
+    code = "JOB_URL_UNREADABLE"
+
+
+# --- IA ---------------------------------------------------------------------
 class AIRateLimitError(ResuMatchError):
     """Limite de requisições da Anthropic atingido."""
 
@@ -86,8 +117,10 @@ def register_exception_handlers(app: FastAPI) -> None:
         # Payload inválido -> 400 com a lista de campos problemáticos.
         details = [
             {
-                "field": ".".join(str(part) for part in err["loc"] if part != "body"),
-                "message": err["msg"],
+                # Erros que envolvem mais de um campo (ex.: vaga sem texto e sem link)
+                # não têm campo específico: field = null.
+                "field": ".".join(str(part) for part in err["loc"] if part != "body") or None,
+                "message": err["msg"].removeprefix("Value error, "),
             }
             for err in exc.errors()
         ]

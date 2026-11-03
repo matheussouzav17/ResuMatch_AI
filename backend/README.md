@@ -1,36 +1,48 @@
 # ResuMatch AI: Backend
 
-API em FastAPI que recebe um **currículo mestre** e uma **descrição de vaga**, envia ao Claude (Anthropic) com engenharia de prompt focada em ATS e devolve um JSON estruturado com análise de palavras-chave, score de aderência, currículo adaptado e carta de apresentação.
+API em FastAPI que recebe os **documentos base** do candidato (currículo mestre e carta de apresentação padrão, em PDF, DOCX, TXT ou texto colado) e uma **vaga** (texto ou link), envia ao Claude (Anthropic) com engenharia de prompt focada em ATS e devolve um JSON estruturado com análise de palavras-chave, score de aderência, currículo otimizado, carta personalizada e uma checagem automática de fidelidade.
 
 ## Estrutura
 
 ```
-resumatch-backend/
+backend/
 ├── app/
-│   ├── main.py                  # Cria o app, CORS, lifespan, registra rotas e handlers
+│   ├── main.py                     # Cria o app, CORS, lifespan (serviços), rotas e handlers
 │   ├── api/
-│   │   └── routes.py            # Controllers: /health e /api/v1/resume/optimize
+│   │   ├── routes.py               # Registra os grupos de rotas
+│   │   ├── dependencies.py         # Injeção de dependências (serviços criados no startup)
+│   │   └── endpoints/
+│   │       ├── system.py           # GET /health
+│   │       ├── resume.py           # POST /api/v1/resume/optimize (JSON) e /optimize/upload (multipart)
+│   │       ├── documents.py        # POST /api/v1/documents/extract (UploadFile -> texto)
+│   │       └── jobs.py             # POST /api/v1/jobs/extract (URL da vaga -> texto)
 │   ├── core/
-│   │   ├── config.py            # Configurações via .env (python-dotenv + pydantic-settings)
-│   │   └── exceptions.py        # Exceções de domínio -> códigos HTTP + formato de erro único
+│   │   ├── config.py               # Configurações via .env (pydantic-settings)
+│   │   └── exceptions.py           # Exceções de domínio -> códigos HTTP + formato de erro único
 │   ├── schemas/
-│   │   └── resume.py            # Models Pydantic de requisição, resposta e saída da IA
+│   │   ├── resume.py               # Requisição/resposta da otimização e saída estruturada da IA
+│   │   └── documents.py            # Documentos e vagas extraídos
 │   └── services/
-│       ├── claude_service.py    # Única camada que conhece a SDK da Anthropic
-│       └── prompts.py           # System prompt (anti-alucinação + ATS) e prompt do usuário
+│       ├── optimization_service.py # Orquestra: resolve a vaga -> IA -> pós-processamento
+│       ├── claude_service.py       # Única camada que conhece a SDK da Anthropic
+│       ├── prompts.py              # System prompt (fidelidade + ATS) e prompt do usuário
+│       ├── document_parser.py      # PDF (pypdf), DOCX (python-docx) e TXT -> texto
+│       ├── job_scraper.py          # Link da vaga -> texto (JSON-LD JobPosting ou HTML), com proteção SSRF
+│       └── fidelity.py             # Checagem determinística: empresas, instituições e anos existem no currículo mestre?
+├── tests/                          # pytest (sem chamar a API real da Anthropic)
 ├── .env.example
-├── .gitignore
-└── requirements.txt
+├── requirements.txt
+└── requirements-dev.txt
 ```
 
-**Fluxo:** `routes.py` valida o payload (Pydantic) → `claude_service.py` chama o Claude com *Structured Outputs* (a resposta é validada contra o schema `AIOptimizationResult`) → erros da SDK viram exceções de domínio → `exceptions.py` converte em HTTP.
+**Fluxo:** a rota valida o payload (Pydantic) → `optimization_service.py` resolve a vaga (texto enviado ou extraído do link) → `claude_service.py` chama o Claude com *Structured Outputs* (resposta validada contra `AIOptimizationResult`) → `fidelity.py` confere os fatos do currículo gerado contra o currículo mestre → erros viram exceções de domínio → `exceptions.py` converte em HTTP.
 
 ## Como rodar localmente (Windows / PowerShell)
 
 Pré-requisito: Python 3.11 ou superior.
 
 ```powershell
-cd resumatch-backend
+cd backend
 
 # 1. Ambiente virtual
 python -m venv .venv
@@ -52,6 +64,16 @@ uvicorn app.main:app --reload --port 8000
 
 - Documentação interativa (Swagger): <http://localhost:8000/docs>
 - Health check: <http://localhost:8000/health>
+- Interface web: <http://localhost:8000/app/>
+
+### Testes
+
+```powershell
+pip install -r requirements-dev.txt
+python -m pytest
+```
+
+Os testes usam um serviço de IA falso (`app.dependency_overrides`) e `httpx.MockTransport` para as páginas de vagas, então não gastam créditos nem acessam a internet.
 
 > Se o PowerShell bloquear o `Activate.ps1`, rode uma vez: `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`.
 
@@ -65,6 +87,10 @@ uvicorn app.main:app --reload --port 8000
 | `CLAUDE_MAX_TOKENS` | `16000` | Limite de tokens da resposta |
 | `CLAUDE_TIMEOUT_SECONDS` | `180` | Timeout por chamada |
 | `CLAUDE_MAX_RETRIES` | `2` | Retentativas automáticas da SDK (429, 5xx, rede) |
+| `MAX_UPLOAD_MB` | `5` | Tamanho máximo de cada arquivo enviado |
+| `JOB_FETCH_TIMEOUT_SECONDS` | `15` | Timeout ao buscar a página da vaga |
+| `JOB_FETCH_MAX_MB` | `3` | Tamanho máximo lido da página da vaga |
+| `JOB_FETCH_ALLOW_PRIVATE_HOSTS` | `false` | Libera URLs da rede interna (só para testes locais) |
 | `CORS_ORIGINS` | `http://localhost:5500,...` | Origens do frontend, separadas por vírgula |
 | `ENVIRONMENT` | `development` | Em `production`, `/docs` é desativado |
 
@@ -72,18 +98,31 @@ uvicorn app.main:app --reload --port 8000
 
 ### `POST /api/v1/resume/optimize`
 
-**Requisição**
+**Requisição (JSON)**
 
 ```json
 {
   "master_resume": "texto do currículo (200 a 30.000 caracteres)",
+  "cover_letter_template": "carta padrão (opcional, até 10.000 caracteres)",
   "job_description": "texto da vaga (100 a 20.000 caracteres)",
+  "job_url": "https://empresa.gupy.io/jobs/123 (opcional)",
   "language": "pt-BR",
   "include_cover_letter": true
 }
 ```
 
-`language` aceita `pt-BR`, `en` ou `es`.
+Envie `job_description` **ou** `job_url`. Só com o link, o backend extrai a vaga antes de chamar a IA. Com os dois, o texto tem prioridade e o link fica como referência (`job_origin`). `language` aceita `pt-BR`, `en` ou `es`.
+
+### `POST /api/v1/resume/optimize/upload` (multipart/form-data)
+
+Mesmo resultado, aceitando os documentos como arquivo: `master_resume_file` **ou** `master_resume`, `cover_letter_file` **ou** `cover_letter_template`, `job_description` **ou** `job_url`, `language`, `include_cover_letter`. Dá para testar direto no Swagger.
+
+```bash
+curl -X POST http://localhost:8000/api/v1/resume/optimize/upload \
+  -F "master_resume_file=@curriculo.pdf" \
+  -F "cover_letter_file=@carta.docx" \
+  -F "job_url=https://empresa.gupy.io/jobs/123"
+```
 
 **Resposta 200**
 
@@ -119,6 +158,8 @@ uvicorn app.main:app --reload --port 8000
   "cover_letter": "texto ou null",
   "suggestions": ["..."],
   "keyword_coverage": 66.7,
+  "fidelity_warnings": [],
+  "job_origin": { "type": "url", "url": "https://...", "source": "structured_data" },
   "metadata": {
     "model": "claude-opus-5-5",
     "input_tokens": 3120,
@@ -128,7 +169,30 @@ uvicorn app.main:app --reload --port 8000
 }
 ```
 
-`category`: `hard_skill`, `soft_skill`, `tool`, `certification`, `domain`. `importance`: `required`, `preferred`. `keyword_coverage` é calculado no backend (não pelo modelo).
+`category`: `hard_skill`, `soft_skill`, `tool`, `certification`, `domain`. `importance`: `required`, `preferred`. `keyword_coverage` e `fidelity_warnings` são calculados no backend (não pelo modelo). `fidelity_warnings` lista empresas, instituições ou anos do currículo otimizado que não aparecem no currículo mestre.
+
+### `POST /api/v1/documents/extract` (multipart)
+
+Campo `file` com PDF, DOCX ou TXT (até `MAX_UPLOAD_MB`). Não chama a IA nem guarda o arquivo.
+
+```json
+{ "filename": "curriculo.pdf", "file_type": "pdf", "text": "...", "page_count": 2, "char_count": 4210 }
+```
+
+### `POST /api/v1/jobs/extract`
+
+```json
+{ "url": "https://empresa.gupy.io/jobs/123" }
+```
+
+```json
+{
+  "url": "...", "final_url": "...", "title": "Desenvolvedor Backend Pleno", "company": "Empresa",
+  "text": "...", "source": "structured_data", "char_count": 3120
+}
+```
+
+`source` é `structured_data` (bloco `schema.org/JobPosting`, usado pelo Google for Jobs e presente na maioria dos sites de vagas) ou `page_text` (texto visível da página, pode ter ruído).
 
 **Erros:** sempre no formato
 
@@ -140,6 +204,10 @@ uvicorn app.main:app --reload --port 8000
 |---|---|---|
 | 400 | `VALIDATION_ERROR` | Campos ausentes, curtos/longos demais ou extras (`details` lista os campos) |
 | 400 | `INVALID_INPUT` | A API do Claude rejeitou o conteúdo |
+| 413 | `FILE_TOO_LARGE` | Arquivo acima de `MAX_UPLOAD_MB` |
+| 415 | `UNSUPPORTED_FILE_TYPE` | Extensão diferente de PDF/DOCX/TXT ou conteúdo que não bate com a extensão |
+| 422 | `DOCUMENT_UNREADABLE` | Arquivo corrompido, com senha ou sem texto (PDF escaneado) |
+| 422 | `JOB_URL_UNREADABLE` | Site bloqueou a leitura (403/429), exige login, vaga não encontrada ou montada só com JavaScript. A mensagem orienta a colar o texto |
 | 429 | `RATE_LIMITED` | Limite da Anthropic (header `Retry-After` incluído) |
 | 500 | `AI_CONFIGURATION_ERROR` | Chave inválida, sem permissão ou modelo inexistente |
 | 500 | `INTERNAL_ERROR` | Erro inesperado |
@@ -154,11 +222,14 @@ uvicorn app.main:app --reload --port 8000
 
 ## Decisões de projeto
 
-- **Fidelidade aos dados:** o system prompt proíbe inventar métricas, cargos, datas ou tecnologias; requisitos sem evidência vão para `gaps`, nunca para o currículo. Cada palavra-chave marcada como presente traz o trecho do currículo que a comprova (`evidence`), o que permite auditar a IA.
+- **Fidelidade aos dados (em duas camadas):** o system prompt trata o currículo mestre como fonte de verdade absoluta e proíbe inventar, promover ou estender cargos, empresas, datas, formações, métricas ou tecnologias; requisitos sem evidência vão para `gaps`, nunca para o currículo. Cada palavra-chave marcada como presente traz o trecho que a comprova (`evidence`). Depois, `fidelity.py` confere sem IA se empresas, instituições e anos do resultado existem no currículo mestre e devolve alertas em `fidelity_warnings`.
+- **Carta padrão:** quando enviada, a IA preserva o tom, a estrutura e as motivações do candidato e personaliza para a vaga. Fatos profissionais da carta só entram se também estiverem no currículo mestre.
+- **Leitura de documentos:** o tipo é validado pela extensão e pela assinatura do arquivo (um `.exe` renomeado para `.pdf` é recusado), o upload é lido em blocos com limite de tamanho e o parsing roda em thread separada para não travar o event loop.
+- **Vaga por link com proteção SSRF:** só `http/https` em portas padrão, e qualquer host que resolva para IP privado, loopback ou link-local (ex.: `169.254.169.254`) é recusado, inclusive após redirecionamentos. Falhas nunca derrubam o fluxo: a mensagem orienta o usuário a colar o texto.
 - **Structured Outputs:** a resposta do Claude é forçada a seguir o schema Pydantic, então o frontend nunca recebe JSON quebrado.
-- **Proteção contra prompt injection:** currículo e vaga vão entre tags XML e o prompt instrui o modelo a tratá-los como dados.
+- **Proteção contra prompt injection:** currículo, carta e vaga vão entre tags XML e o prompt instrui o modelo a tratá-los como dados.
 - **Fallback de recusa:** em modelos compatíveis, a requisição usa o fallback automático do servidor da Anthropic caso um classificador de segurança recuse o conteúdo.
-- **Cliente único:** o `AsyncAnthropic` é criado uma vez no startup (lifespan) e reaproveita conexões.
+- **Clientes únicos:** o `AsyncAnthropic` e o `httpx.AsyncClient` do scraper são criados uma vez no startup (lifespan) e reaproveitam conexões.
 - **Tempo de resposta:** uma otimização completa costuma levar de 30 s a 1 min. No frontend, mostre um estado de carregamento e não use timeout curto no `fetch`.
 
 ## Exemplo com `curl`

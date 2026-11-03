@@ -23,7 +23,7 @@ class Settings(BaseSettings):
 
     # --- Aplicação ---
     app_name: str = "ResuMatch AI API"
-    app_version: str = "1.0.0"
+    app_version: str = "2.0.0"
     environment: Literal["development", "production"] = "development"
     log_level: str = "INFO"
 
@@ -35,9 +35,22 @@ class Settings(BaseSettings):
     claude_timeout_seconds: float = Field(180.0, gt=0)
     claude_max_retries: int = Field(2, ge=0, le=5)
 
+    # --- Upload de documentos (PDF, DOCX, TXT) ---
+    max_upload_mb: float = Field(5.0, gt=0, le=25, description="Tamanho máximo por arquivo")
+
+    # --- Extração de vagas por URL ---
+    job_fetch_timeout_seconds: float = Field(15.0, gt=0, le=60)
+    job_fetch_max_mb: float = Field(3.0, gt=0, le=10, description="Tamanho máximo da página HTML")
+    # Proteção contra SSRF: por padrão, URLs que apontam para a rede interna
+    # (localhost, 10.x, 192.168.x...) são bloqueadas. Só ligue em testes locais.
+    job_fetch_allow_private_hosts: bool = False
+
     # --- CORS ---
     # Aceita uma string separada por vírgulas no .env.
     cors_origins: str = "http://localhost:5500,http://127.0.0.1:5500"
+    # Em desenvolvimento, aceita também qualquer porta de localhost/127.0.0.1
+    # (Live Server, `python -m http.server`, Vite...). Deixe vazio para desligar.
+    cors_origin_regex: str = r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$"
 
     @field_validator("anthropic_api_key")
     @classmethod
@@ -52,6 +65,21 @@ class Settings(BaseSettings):
     @property
     def cors_origins_list(self) -> list[str]:
         return [origin.strip() for origin in self.cors_origins.split(",") if origin.strip()]
+
+    @property
+    def cors_origin_regex_or_none(self) -> str | None:
+        """Regex de origens liberadas; desligada em produção ou se vazia."""
+        if self.is_production or not self.cors_origin_regex.strip():
+            return None
+        return self.cors_origin_regex.strip()
+
+    @property
+    def max_upload_bytes(self) -> int:
+        return int(self.max_upload_mb * 1024 * 1024)
+
+    @property
+    def job_fetch_max_bytes(self) -> int:
+        return int(self.job_fetch_max_mb * 1024 * 1024)
 
     @property
     def is_production(self) -> bool:
